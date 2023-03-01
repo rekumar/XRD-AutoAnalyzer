@@ -9,6 +9,8 @@ import numpy as np
 import warnings
 import math
 
+from autoXRD.pattern_analysis.utils import get_radiation_wavelength
+
 
 class SpectrumPlotter(object):
     """
@@ -44,7 +46,7 @@ class SpectrumPlotter(object):
         self.calculator = xrd.XRDCalculator()
         self.min_angle = min_angle
         self.max_angle = max_angle
-        self.wavelen = wavelength
+        self.wavelen = get_radiation_wavelength(wavelength)
 
         # If scale factors haven't been calculated yet, do it now
         # For use with the visualize script

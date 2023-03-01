@@ -1,18 +1,19 @@
 from scipy.signal import filtfilt, resample
-from pymatgen.analysis.diffraction import xrd
-from scipy.ndimage import gaussian_filter1d
 from scipy import interpolate as ip
 from pymatgen.core import Structure
 from skimage import restoration
 import tensorflow as tf
-from scipy import signal
 from pyts import metrics
 import numpy as np
 import warnings
-import math
 import os
-
+from autoXRD.pattern_analysis.utils import (
+    convert_angle,
+    generate_pattern,
+    get_radiation_wavelength,
+)
 from autoXRD.cnn.dropout import CustomDropout, KerasDropoutPrediction
+from autoXRD.visualizer.utils import XRDtoPDF
 
 
 class SpectrumAnalyzer(object):
@@ -20,8 +21,20 @@ class SpectrumAnalyzer(object):
     Class used to process and classify xrd spectra.
     """
 
-    def __init__(self, spectra_dir, spectrum_fname, max_phases, cutoff_intensity, min_conf=25.0, wavelen='CuKa',
-        reference_dir='References', min_angle=10.0, max_angle=80.0, model_path='Model.h5', is_pdf=False):
+    def __init__(
+        self,
+        spectra_dir,
+        spectrum_fname,
+        max_phases,
+        cutoff_intensity,
+        min_conf=25.0,
+        wavelen="CuKa",
+        reference_dir="References",
+        min_angle=10.0,
+        max_angle=80.0,
+        model_path="Model.h5",
+        is_pdf=False,
+    ):
         """
         Args:
             spectrum_fname: name of file containing the
@@ -35,11 +48,10 @@ class SpectrumAnalyzer(object):
         self.spectra_dir = spectra_dir
         self.spectrum_fname = spectrum_fname
         self.ref_dir = reference_dir
-        self.calculator = xrd.XRDCalculator()
         self.max_phases = max_phases
         self.cutoff = cutoff_intensity
         self.min_conf = min_conf
-        self.wavelen = wavelen
+        self.wavelen = get_radiation_wavelength(wavelen)
         self.min_angle = min_angle
         self.max_angle = max_angle
         self.model_path = model_path
@@ -59,30 +71,22 @@ class SpectrumAnalyzer(object):
 
         spectrum = self.formatted_spectrum
 
-        self.model = tf.keras.models.load_model(self.model_path, custom_objects={'CustomDropout': CustomDropout}, compile=False)
+        self.model = tf.keras.models.load_model(
+            self.model_path,
+            custom_objects={"CustomDropout": CustomDropout},
+            compile=False,
+        )
         self.kdp = KerasDropoutPrediction(self.model)
 
-        prediction_list, confidence_list, backup_list, scale_list, spec_list = self.enumerate_routes(spectrum)
+        (
+            prediction_list,
+            confidence_list,
+            backup_list,
+            scale_list,
+            spec_list,
+        ) = self.enumerate_routes(spectrum)
 
         return prediction_list, confidence_list, backup_list, scale_list, spec_list
-
-    def convert_angle(self, angle):
-        """
-        Convert two-theta into Cu K-alpha radiation.
-        """
-
-        orig_theta = math.radians(angle/2.)
-
-        orig_lambda = self.wavelen
-        target_lambda = 1.5406 # Cu k-alpha
-        ratio_lambda = target_lambda/orig_lambda
-
-        asin_argument = ratio_lambda*math.sin(orig_theta)
-
-        # Curtail two-theta range if needed to avoid domain errors
-        if asin_argument <= 1:
-            new_theta = math.degrees(math.asin(ratio_lambda*math.sin(orig_theta)))
-            return 2*new_theta
 
     @property
     def formatted_spectrum(self):
@@ -97,15 +101,19 @@ class SpectrumAnalyzer(object):
         """
 
         ## Load data
-        data = np.loadtxt('%s/%s' % (self.spectra_dir, self.spectrum_fname))
+        data = np.loadtxt("%s/%s" % (self.spectra_dir, self.spectrum_fname))
         x = data[:, 0]
         y = data[:, 1]
 
         ## Convert to Cu K-alpha radiation if needed
-        if str(self.wavelen) != 'CuKa':
+        if self.wavelen != 1.5406:
             Cu_x, Cu_y = [], []
             for (two_thet, intens) in zip(x, y):
-                scaled_x = self.convert_angle(two_thet)
+                scaled_x = convert_angle(
+                    two_theta=two_thet,
+                    original_wavelength_angstroms=self.wavelen,
+                    target_wavelength_angstroms=1.5406,
+                )
                 if scaled_x is not None:
                     Cu_x.append(scaled_x)
                     Cu_y.append(intens)
@@ -114,13 +122,15 @@ class SpectrumAnalyzer(object):
         # Allow some tolerance (0.2 degrees) in the two-theta range
         if (min(x) > self.min_angle) and np.isclose(min(x), self.min_angle, atol=0.2):
             x = np.concatenate([np.array([self.min_angle]), x])
-       	    y = np.concatenate([np.array([y[0]]), y])
-       	if (max(x) < self.max_angle) and np.isclose(max(x), self.max_angle, atol=0.2):
-       	    x = np.concatenate([x, np.array([self.max_angle])])
+            y = np.concatenate([np.array([y[0]]), y])
+        if (max(x) < self.max_angle) and np.isclose(max(x), self.max_angle, atol=0.2):
+            x = np.concatenate([x, np.array([self.max_angle])])
             y = np.concatenate([y, np.array([y[-1]])])
 
         # Otherwise, raise an assertion error
-        assert (min(x) <= self.min_angle) and (max(x) >= self.max_angle), """
+        assert (min(x) <= self.min_angle) and (
+            max(x) >= self.max_angle
+        ), """
                Measured spectrum does not span the specified two-theta range!
                Either use a broader spectrum or change the two-theta range via
                the --min_angle and --max_angle arguments."""
@@ -135,7 +145,7 @@ class SpectrumAnalyzer(object):
 
         ## Normalize from 0 to 255
         ys = np.array(ys) - min(ys)
-        ys = list(255*np.array(ys)/max(ys))
+        ys = list(255 * np.array(ys) / max(ys))
 
         # Subtract background
         background = restoration.rolling_ball(ys, radius=800)
@@ -143,7 +153,7 @@ class SpectrumAnalyzer(object):
 
         ## Normalize from 0 to 100
         ys = np.array(ys) - min(ys)
-        ys = list(100*np.array(ys)/max(ys))
+        ys = list(100 * np.array(ys) / max(ys))
 
         return ys
 
@@ -169,8 +179,22 @@ class SpectrumAnalyzer(object):
 
         return smoothed_ys
 
-    def enumerate_routes(self, xrd_spectrum, indiv_pred=[], indiv_conf=[], indiv_backup=[], prediction_list=[], confidence_list=[],
-        backup_list=[], is_first=True, normalization=1.0, indiv_scale=[], scale_list=[], indiv_spec=[], spec_list=[]):
+    def enumerate_routes(
+        self,
+        xrd_spectrum,
+        indiv_pred=[],
+        indiv_conf=[],
+        indiv_backup=[],
+        prediction_list=[],
+        confidence_list=[],
+        backup_list=[],
+        is_first=True,
+        normalization=1.0,
+        indiv_scale=[],
+        scale_list=[],
+        indiv_spec=[],
+        spec_list=[],
+    ):
         """
         A branching algorithm designed to explore all suspected mixtures predicted by the CNN.
         For each mixture, the associated phases and probabilities are tabulated.
@@ -199,31 +223,56 @@ class SpectrumAnalyzer(object):
 
         # Convert to PDF if specified
         if self.is_pdf:
-            pdf_spectrum = self.XRDtoPDF(xrd_spectrum, self.min_angle, self.max_angle)
+            twotheta = np.linspace(self.min_angle, self.max_angle, 4501)
+            pdf_spectrum = XRDtoPDF(
+                twotheta=twotheta, xrd=xrd_spectrum, wavelength_angstroms=self.wavelen
+            )
 
         # Make prediction and confidence lists global so they can be updated recursively
         # If this is the top-level of a new mixture (is_first), reset all variables
         if is_first:
             global updated_pred, updated_conf, updated_backup, updated_scale, updated_spec
-            updated_pred, updated_conf, updated_backup, updated_scale, updated_spec = None, None, None, None, None
+            updated_pred, updated_conf, updated_backup, updated_scale, updated_spec = (
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             prediction_list, confidence_list, backup_list, scale_list = [], [], [], []
             indiv_pred, indiv_conf, indiv_backup, indiv_scale = [], [], [], []
             indiv_spec, spec_list = [], []
 
         # Make prediction regarding top phases
         if self.is_pdf:
-            prediction, num_phases, certanties = self.kdp.predict(pdf_spectrum, self.min_conf)
+            prediction, num_phases, certanties = self.kdp.predict(
+                pdf_spectrum, self.min_conf
+            )
         else:
-            prediction, num_phases, certanties = self.kdp.predict(xrd_spectrum, self.min_conf)
+            prediction, num_phases, certanties = self.kdp.predict(
+                xrd_spectrum, self.min_conf
+            )
 
         # If no phases are suspected
         if num_phases == 0:
 
             # If individual predictions have been updated recursively, use them for this iteration
-            if 'updated_pred' in globals():
+            if "updated_pred" in globals():
                 if updated_pred != None:
-                    indiv_pred, indiv_conf, indiv_scale, indiv_backup, indiv_spec = updated_pred, updated_conf, updated_scale, updated_backup, updated_spec
-                    updated_pred, updated_conf, updated_scale, updated_backup, updated_spec = None, None, None, None, None
+                    indiv_pred, indiv_conf, indiv_scale, indiv_backup, indiv_spec = (
+                        updated_pred,
+                        updated_conf,
+                        updated_scale,
+                        updated_backup,
+                        updated_spec,
+                    )
+                    (
+                        updated_pred,
+                        updated_conf,
+                        updated_scale,
+                        updated_backup,
+                        updated_spec,
+                    ) = (None, None, None, None, None)
 
             confidence_list.append(indiv_conf)
             prediction_list.append(indiv_pred)
@@ -235,19 +284,31 @@ class SpectrumAnalyzer(object):
         for i in range(num_phases):
 
             # If individual predictions have been updated recursively, use them for this iteration
-            if 'updated_pred' in globals():
+            if "updated_pred" in globals():
                 if updated_pred != None:
-                    indiv_pred, indiv_conf, indiv_scale, indiv_backup, indiv_spec = updated_pred, updated_conf, updated_scale, updated_backup, updated_spec
-                    updated_pred, updated_conf, updated_scale, updated_backup, updated_spec = None, None, None, None, None
+                    indiv_pred, indiv_conf, indiv_scale, indiv_backup, indiv_spec = (
+                        updated_pred,
+                        updated_conf,
+                        updated_scale,
+                        updated_backup,
+                        updated_spec,
+                    )
+                    (
+                        updated_pred,
+                        updated_conf,
+                        updated_scale,
+                        updated_backup,
+                        updated_spec,
+                    ) = (None, None, None, None, None)
 
-            phase_index = np.array(prediction).argsort()[-(i+1)]
+            phase_index = np.array(prediction).argsort()[-(i + 1)]
             predicted_cmpd = self.reference_phases[phase_index]
 
             # If there exists two probable phases
             if num_phases > 1:
                 # For 1st most probable phase, choose 2nd most probable as backup
                 if i == 0:
-                    backup_index = np.array(prediction).argsort()[-(i+2)]
+                    backup_index = np.array(prediction).argsort()[-(i + 2)]
                 # For 2nd most probable phase, choose 1st most probable as backup
                 # For 3rd most probable phase, choose 2nd most probable as backup (and so on)
                 elif i >= 1:
@@ -281,7 +342,14 @@ class SpectrumAnalyzer(object):
             indiv_backup.append(backup_cmpd)
 
             # Subtract identified phase from the spectrum
-            reduced_spectrum, norm, scaling_constant, is_done = self.get_reduced_pattern(predicted_cmpd, xrd_spectrum, last_normalization=normalization)
+            (
+                reduced_spectrum,
+                norm,
+                scaling_constant,
+                is_done,
+            ) = self.get_reduced_pattern(
+                predicted_cmpd, xrd_spectrum, last_normalization=normalization
+            )
 
             # Record actual spectrum (non-scaled) after peak substraction of known phases
             actual_spectrum = reduced_spectrum / norm
@@ -318,7 +386,10 @@ class SpectrumAnalyzer(object):
                     spec_list.append(indiv_spec)
                     if i == (num_phases - 1):
                         updated_conf, updated_pred = indiv_conf[:-2], indiv_pred[:-2]
-                        updated_backup, updated_scale = indiv_backup[:-2], indiv_scale[:-2]
+                        updated_backup, updated_scale = (
+                            indiv_backup[:-2],
+                            indiv_scale[:-2],
+                        )
                         updated_spec = indiv_spec[:-2]
                     else:
                         indiv_conf, indiv_pred = indiv_conf[:-1], indiv_pred[:-1]
@@ -327,10 +398,27 @@ class SpectrumAnalyzer(object):
                     continue
 
                 # Otherwise if more phases are to be explored, recursively enter enumerate_routes with the newly reduced spectrum
-                prediction_list, confidence_list, backup_list, scale_list, spec_list = \
-                    self.enumerate_routes(reduced_spectrum, indiv_pred, indiv_conf, indiv_backup, prediction_list,
-                    confidence_list, backup_list, is_first=False, normalization=norm, indiv_scale=indiv_scale,
-                    scale_list=scale_list, indiv_spec=indiv_spec, spec_list=spec_list)
+                (
+                    prediction_list,
+                    confidence_list,
+                    backup_list,
+                    scale_list,
+                    spec_list,
+                ) = self.enumerate_routes(
+                    reduced_spectrum,
+                    indiv_pred,
+                    indiv_conf,
+                    indiv_backup,
+                    prediction_list,
+                    confidence_list,
+                    backup_list,
+                    is_first=False,
+                    normalization=norm,
+                    indiv_scale=indiv_scale,
+                    scale_list=scale_list,
+                    indiv_spec=indiv_spec,
+                    spec_list=spec_list,
+                )
 
         return prediction_list, confidence_list, backup_list, scale_list, spec_list
 
@@ -364,17 +452,23 @@ class SpectrumAnalyzer(object):
         orig_y = np.array(orig_y)
 
         # Downsample spectra (helps reduce time for DTW)
-        downsampled_res = 0.1 # new resolution: 0.1 degrees
+        downsampled_res = 0.1  # new resolution: 0.1 degrees
         num_pts = int((self.max_angle - self.min_angle) / downsampled_res)
         orig_y = resample(orig_y, num_pts)
         pred_y = resample(pred_y, num_pts)
 
         # Calculate window size for DTW
-        allow_shifts = 0.75 # Allow shifts up to 0.75 degrees
+        allow_shifts = 0.75  # Allow shifts up to 0.75 degrees
         window_size = int(allow_shifts * num_pts / (self.max_angle - self.min_angle))
 
         # Get warped spectrum (DTW)
-        distance, path = metrics.dtw(pred_y, orig_y, method='sakoechiba', options={'window_size': window_size}, return_path=True)
+        distance, path = metrics.dtw(
+            pred_y,
+            orig_y,
+            method="sakoechiba",
+            options={"window_size": window_size},
+            return_path=True,
+        )
         index_pairs = path.transpose()
         warped_spectrum = orig_y.copy()
         for ind1, ind2 in index_pairs:
@@ -397,8 +491,8 @@ class SpectrumAnalyzer(object):
         stripped_y = np.array(stripped_y) - min(stripped_y)
 
         # Normalization
-        new_normalization = 100/max(stripped_y)
-        actual_intensity = max(stripped_y)/last_normalization
+        new_normalization = 100 / max(stripped_y)
+        actual_intensity = max(stripped_y) / last_normalization
 
         # Calculate actual scaling constant
         scaling_constant /= last_normalization
@@ -409,29 +503,14 @@ class SpectrumAnalyzer(object):
         else:
             is_done = False
 
-        stripped_y = new_normalization*stripped_y
+        stripped_y = new_normalization * stripped_y
 
-        return stripped_y, last_normalization*new_normalization, scaling_constant, is_done
-
-
-    def calc_std_dev(self, two_theta, tau):
-        """
-        calculate standard deviation based on angle (two theta) and domain size (tau)
-        Args:
-            two_theta: angle in two theta space
-            tau: domain size in nm
-        Returns:
-            standard deviation for gaussian kernel
-        """
-        ## Calculate FWHM based on the Scherrer equation
-        K = 0.9 ## shape factor
-        wavelength = self.calculator.wavelength * 0.1 ## angstrom to nm
-        theta = np.radians(two_theta/2.) ## Bragg angle in radians
-        beta = (K * wavelength) / (np.cos(theta) * tau) # in radians
-
-        ## Convert FWHM to std deviation of gaussian
-        sigma = np.sqrt(1/(2*np.log(2)))*0.5*np.degrees(beta)
-        return sigma**2
+        return (
+            stripped_y,
+            last_normalization * new_normalization,
+            scaling_constant,
+            is_done,
+        )
 
     def generate_pattern(self, cmpd):
         """
@@ -444,41 +523,18 @@ class SpectrumAnalyzer(object):
         """
 
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore") # don't print occupancy-related warnings
-            struct = Structure.from_file('%s/%s' % (self.ref_dir, cmpd))
-        equil_vol = struct.volume
-        pattern = self.calculator.get_pattern(struct, two_theta_range=(self.min_angle, self.max_angle))
-        angles = pattern.x
-        intensities = pattern.y
+            warnings.simplefilter("ignore")  # don't print occupancy-related warnings
+            struct = Structure.from_file("%s/%s" % (self.ref_dir, cmpd))
+        twotheta = np.linspace(self.min_angle, self.max_angle, 4501)
+        signal = generate_pattern(
+            structure=struct,
+            twotheta=twotheta,
+            normalize=True,
+            domain_size_nm=25.0,
+            wavelength_angstroms=self.wavelen,
+        )
 
-        steps = np.linspace(self.min_angle, self.max_angle, 4501)
-
-        signals = np.zeros([len(angles), steps.shape[0]])
-
-        for i, ang in enumerate(angles):
-            # Map angle to closest datapoint step
-            idx = np.argmin(np.abs(ang-steps))
-            signals[i,idx] = intensities[i]
-
-        # Convolute every row with unique kernel
-        # Iterate over rows; not vectorizable, changing kernel for every row
-        domain_size = 25.0
-        step_size = (self.max_angle - self.min_angle)/4501
-        for i in range(signals.shape[0]):
-            row = signals[i,:]
-            ang = steps[np.argmax(row)]
-            std_dev = self.calc_std_dev(ang, domain_size)
-            # Gaussian kernel expects step size 1 -> adapt std_dev
-            signals[i,:] = gaussian_filter1d(row, np.sqrt(std_dev)*1/step_size,
-                                             mode='constant')
-
-        # Combine signals
-        signal = np.sum(signals, axis=0)
-
-        # Normalize signal
-        norm_signal = 100 * signal / max(signal)
-
-        return norm_signal
+        return signal
 
     def scale_spectrum(self, pred_y, obs_y):
         """
@@ -501,11 +557,11 @@ class SpectrumAnalyzer(object):
         # Find scaling constant that minimizes MSE between pred_y and obs_y
         all_mse = []
         for scale_spectrum in np.linspace(1.1, 0.05, 101):
-            ydiff = obs_y - (scale_spectrum*pred_y)
+            ydiff = obs_y - (scale_spectrum * pred_y)
             mse = np.mean(ydiff**2)
             all_mse.append(mse)
         best_scale = np.linspace(1.0, 0.05, 101)[np.argmin(all_mse)]
-        scaled_spectrum = best_scale*np.array(pred_y)
+        scaled_spectrum = best_scale * np.array(pred_y)
 
         return scaled_spectrum, best_scale
 
@@ -535,19 +591,3 @@ class SpectrumAnalyzer(object):
                 fixed_y.append(val)
 
         return fixed_y
-
-    def XRDtoPDF(self, xrd, min_angle, max_angle):
-
-        thetas = np.linspace(min_angle/2.0, max_angle/2.0, 4501)
-        Q = np.array([4*math.pi*math.sin(math.radians(theta))/1.5406 for theta in thetas])
-        S = np.array(xrd).flatten()
-
-        pdf = []
-        R = np.linspace(1, 40, 1000) # Only 1000 used to reduce compute time
-        integrand = Q * S * np.sin(Q * R[:, np.newaxis])
-
-        pdf = (2*np.trapz(integrand, Q) / math.pi)
-        pdf = list(signal.resample(pdf, 4501))
-
-        return pdf
-
