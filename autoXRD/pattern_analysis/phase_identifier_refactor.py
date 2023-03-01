@@ -1,6 +1,6 @@
 from multiprocessing import Pool, Manager
 import multiprocessing
-from typing import Literal, Optional, Union
+from typing import Optional, Union
 import tensorflow as tf
 from tqdm import tqdm
 import numpy as np
@@ -8,6 +8,7 @@ import os
 
 from autoXRD.cnn.dropout import CustomDropout, KerasDropoutPrediction
 from autoXRD.pattern_analysis.utils import get_radiation_wavelength
+from .analyzer import DirectoryPatternAnalyzer
 
 
 class PhaseIdentifier(object):
@@ -27,7 +28,6 @@ class PhaseIdentifier(object):
         parallel: bool = True,
         model_path: str = "Model.h5",
         is_pdf: bool = False,
-        lazy_load: bool = False,
     ):
         """
         Args:
@@ -42,23 +42,12 @@ class PhaseIdentifier(object):
         self.max_phases = max_phases
         self.cutoff = cutoff_intensity
         self.min_conf = min_conf
-        self.wavelen = get_radiation_wavelength(wavelen)
+        self.wavelen = get_radiation_wavelength(wavelength)
         self.parallel = parallel
         self.min_angle = min_angle
         self.max_angle = max_angle
         self.model_path = model_path
         self.is_pdf = is_pdf
-        self._load_model()
-
-    def _load_model(self, model_path: Optional[str] = None):
-        if model_path:
-            self.model_path = model_path
-        self.model = tf.keras.models.load_model(
-            self.model_path,
-            custom_objects={"CustomDropout": CustomDropout},
-            compile=False,
-        )
-        self.kdp = KerasDropoutPrediction(self.model)
 
     @property
     def all_predictions(self):
@@ -121,7 +110,7 @@ class PhaseIdentifier(object):
         total_confidence, all_predictions = [], []
         tabulate_conf, predicted_cmpd_set = [], []
 
-        spec_analysis = SpectrumAnalyzer(
+        spec_analysis = DirectoryPatternAnalyzer(
             self.spectra_dir,
             spectrum_fname,
             self.max_phases,

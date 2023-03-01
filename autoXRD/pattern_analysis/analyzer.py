@@ -1,3 +1,4 @@
+from typing import List, Optional, Union
 from scipy.signal import filtfilt, resample
 from scipy import interpolate as ip
 from pymatgen.core import Structure
@@ -11,29 +12,29 @@ from autoXRD.pattern_analysis.utils import (
     convert_angle,
     generate_pattern,
     get_radiation_wavelength,
+    XRDtoPDF,
+    scale_spectrum,
+    strip_spectrum,
+    smooth_spectrum,
 )
 from autoXRD.cnn.dropout import CustomDropout, KerasDropoutPrediction
-from autoXRD.visualizer.utils import XRDtoPDF
 
 
-class SpectrumAnalyzer(object):
+class PatternAnalyzer(object):
     """
-    Class used to process and classify xrd spectra.
+    Class used to process and classify xrd patterns using a pretrained AutoXRD model.
     """
 
     def __init__(
         self,
-        spectra_dir,
-        spectrum_fname,
-        max_phases,
-        cutoff_intensity,
-        min_conf=25.0,
-        wavelen="CuKa",
-        reference_dir="References",
-        min_angle=10.0,
-        max_angle=80.0,
-        model_path="Model.h5",
-        is_pdf=False,
+        max_phases: int,
+        cutoff_intensity: float,
+        min_conf: float = 25.0,
+        wavelength: Union[str, float] = "CuKa",
+        min_angle: float = 10.0,
+        max_angle: float = 80.0,
+        model_path: str = "Model.h5",
+        is_pdf: bool = False,
     ):
         """
         Args:
@@ -44,33 +45,19 @@ class SpectrumAnalyzer(object):
             wavelen: wavelength used for diffraction (angstroms).
                 Defaults to Cu K-alpha radiation (1.5406 angstroms).
         """
-
-        self.spectra_dir = spectra_dir
-        self.spectrum_fname = spectrum_fname
-        self.ref_dir = reference_dir
         self.max_phases = max_phases
         self.cutoff = cutoff_intensity
         self.min_conf = min_conf
-        self.wavelen = get_radiation_wavelength(wavelen)
+        self.wavelen = get_radiation_wavelength(wavelength)
         self.min_angle = min_angle
         self.max_angle = max_angle
         self.model_path = model_path
         self.is_pdf = is_pdf
+        self._load_model()
 
-    @property
-    def reference_phases(self):
-        return sorted(os.listdir(self.ref_dir))
-
-    @property
-    def suspected_mixtures(self):
-        """
-        Returns:
-            prediction_list: a list of all enumerated mixtures
-            confidence_list: a list of probabilities associated with the above mixtures
-        """
-
-        spectrum = self.formatted_spectrum
-
+    def _load_model(self, model_path: Optional[str] = None):
+        if model_path:
+            self.model_path = model_path
         self.model = tf.keras.models.load_model(
             self.model_path,
             custom_objects={"CustomDropout": CustomDropout},
@@ -78,35 +65,46 @@ class SpectrumAnalyzer(object):
         )
         self.kdp = KerasDropoutPrediction(self.model)
 
+    def predict(self, twotheta: List[float], intensity: List[float]):
+        """
+        Returns:
+            prediction_list: a list of all enumerated mixtures
+            confidence_list: a list of probabilities associated with the above mixtures
+        """
+
+        formatted_intensity = self._format_spectrum(twotheta, intensity)
+
         (
             prediction_list,
             confidence_list,
             backup_list,
             scale_list,
             spec_list,
-        ) = self.enumerate_routes(spectrum)
+        ) = self._enumerate_routes(formatted_intensity)
 
         return prediction_list, confidence_list, backup_list, scale_list, spec_list
 
-    @property
-    def formatted_spectrum(self):
+    def _format_spectrum(
+        self, twotheta: List[float], intensity: List[float]
+    ) -> np.ndarray:
         """
         Cleans up a measured spectrum and format it such that it
         is directly readable by the CNN.
 
         Args:
-            spectrum_name: filename of the spectrum that is being considered
+            twotheta: List of two-theta values
+            intensity: List of intensity values
         Returns:
-            ys: Processed XRD spectrum in 4501x1 form.
+            ys: Processed pattern intensity in 4501x1 form.
         """
 
         ## Load data
-        data = np.loadtxt("%s/%s" % (self.spectra_dir, self.spectrum_fname))
-        x = data[:, 0]
-        y = data[:, 1]
+
+        x = twotheta
+        y = intensity
 
         ## Convert to Cu K-alpha radiation if needed
-        if self.wavelen != 1.5406:
+        if self.wavelen != get_radiation_wavelength("CuKa"):
             Cu_x, Cu_y = [], []
             for (two_thet, intens) in zip(x, y):
                 scaled_x = convert_angle(
@@ -141,7 +139,7 @@ class SpectrumAnalyzer(object):
         ys = f(xs)
 
         ## Smooth out noise
-        ys = self.smooth_spectrum(ys)
+        ys = smooth_spectrum(ys)
 
         ## Normalize from 0 to 255
         ys = np.array(ys) - min(ys)
@@ -157,29 +155,121 @@ class SpectrumAnalyzer(object):
 
         return ys
 
-    def smooth_spectrum(self, spectrum, n=20):
+    def _get_reduced_pattern(self, predicted_cmpd, orig_y, last_normalization=1.0):
         """
-        Process and remove noise from the spectrum.
+        Subtract a phase that has already been identified from a given XRD spectrum.
+        If all phases have already been identified, halt the iteration.
 
         Args:
-            spectrum: list of intensities as a function of 2-theta
-            n: parameters used to control smooth. Larger n means greater smoothing.
-                20 is typically a good number such that noise is reduced while
-                still retaining minor diffraction peaks.
+            predicted_cmpd: phase that has been identified
+            orig_y: measured spectrum including the phase the above phase
+            last_normalization: normalization factor used to scale the previously stripped
+                spectrum to 100 (required by the CNN). This is necessary to determine the
+                magnitudes of intensities relative to the initially measured pattern.
+            cutoff: the % cutoff used to halt the phase ID iteration. If all intensities are
+                below this value in terms of the originally measured maximum intensity, then
+                the code assumes that all phases have been identified.
         Returns:
-            smoothed_ys: processed spectrum after noise removal
+            stripped_y: new spectrum obtained by subtrating the peaks of the identified phase
+            new_normalization: scaling factor used to ensure the maximum intensity is equal to 100
+            Or
+            If intensities fall below the cutoff, preserve orig_y and return Nonetype
+                the for new_normalization constant.
         """
 
-        # Smoothing parameters defined by n
-        b = [1.0 / n] * n
-        a = 1
+        # Simulate spectrum for predicted compounds
+        pred_y = self._generate_pattern(predicted_cmpd)
 
-        # Filter noise
-        smoothed_ys = filtfilt(b, a, spectrum)
+        # Convert to numpy arrays
+        pred_y = np.array(pred_y)
+        orig_y = np.array(orig_y)
 
-        return smoothed_ys
+        # Downsample spectra (helps reduce time for DTW)
+        downsampled_res = 0.1  # new resolution: 0.1 degrees
+        num_pts = int((self.max_angle - self.min_angle) / downsampled_res)
+        orig_y = resample(orig_y, num_pts)
+        pred_y = resample(pred_y, num_pts)
 
-    def enumerate_routes(
+        # Calculate window size for DTW
+        allow_shifts = 0.75  # Allow shifts up to 0.75 degrees
+        window_size = int(allow_shifts * num_pts / (self.max_angle - self.min_angle))
+
+        # Get warped spectrum (DTW)
+        distance, path = metrics.dtw(
+            pred_y,
+            orig_y,
+            method="sakoechiba",
+            options={"window_size": window_size},
+            return_path=True,
+        )
+        index_pairs = path.transpose()
+        warped_spectrum = orig_y.copy()
+        for ind1, ind2 in index_pairs:
+            distance = abs(ind1 - ind2)
+            if distance <= window_size:
+                warped_spectrum[ind2] = pred_y[ind1]
+            else:
+                warped_spectrum[ind2] = 0.0
+
+        # Now, upsample spectra back to their original size (4501)
+        warped_spectrum = resample(warped_spectrum, 4501)
+        orig_y = resample(orig_y, 4501)
+
+        # Scale warped spectrum so y-values match measured spectrum
+        scaled_spectrum, scaling_constant = scale_spectrum(warped_spectrum, orig_y)
+
+        # Subtract scaled spectrum from measured spectrum
+        stripped_y = strip_spectrum(scaled_spectrum, orig_y)
+        stripped_y = smooth_spectrum(stripped_y)
+        stripped_y = np.array(stripped_y) - min(stripped_y)
+
+        # Normalization
+        new_normalization = 100 / max(stripped_y)
+        actual_intensity = max(stripped_y) / last_normalization
+
+        # Calculate actual scaling constant
+        scaling_constant /= last_normalization
+
+        # If intensities fall above cutoff, halt enumeration
+        if actual_intensity < self.cutoff:
+            is_done = True
+        else:
+            is_done = False
+
+        stripped_y = new_normalization * stripped_y
+
+        return (
+            stripped_y,
+            last_normalization * new_normalization,
+            scaling_constant,
+            is_done,
+        )
+
+    def _generate_pattern(self, cmpd):
+        """
+        Calculate the XRD spectrum of a given compound.
+
+        Args:
+            cmpd: filename of the structure file to calculate the spectrum for
+        Returns:
+            all_I: list of intensities as a function of two-theta
+        """
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # don't print occupancy-related warnings
+            struct = Structure.from_file("%s/%s" % (self.ref_dir, cmpd))
+        twotheta = np.linspace(self.min_angle, self.max_angle, 4501)
+        signal = generate_pattern(
+            structure=struct,
+            twotheta=twotheta,
+            normalize=True,
+            domain_size_nm=25.0,
+            wavelength_angstroms=self.wavelen,
+        )
+
+        return signal
+
+    def _enumerate_routes(
         self,
         xrd_spectrum,
         indiv_pred=[],
@@ -347,7 +437,7 @@ class SpectrumAnalyzer(object):
                 norm,
                 scaling_constant,
                 is_done,
-            ) = self.get_reduced_pattern(
+            ) = self._get_reduced_pattern(
                 predicted_cmpd, xrd_spectrum, last_normalization=normalization
             )
 
@@ -404,7 +494,7 @@ class SpectrumAnalyzer(object):
                     backup_list,
                     scale_list,
                     spec_list,
-                ) = self.enumerate_routes(
+                ) = self._enumerate_routes(
                     reduced_spectrum,
                     indiv_pred,
                     indiv_conf,
@@ -422,172 +512,99 @@ class SpectrumAnalyzer(object):
 
         return prediction_list, confidence_list, backup_list, scale_list, spec_list
 
-    def get_reduced_pattern(self, predicted_cmpd, orig_y, last_normalization=1.0):
+
+class DirectoryPatternAnalyzer(PatternAnalyzer):
+    """
+    Class for analyzing a directory of patterns.
+
+    Attributes
+    ----------
+    directory : str
+        Path to directory containing patterns to be analyzed.
+    reference_phases : list
+        List of phases to be used for analysis.
+    max_phases : int
+        Maximum number of phases to be considered in a mixture.
+    """
+
+    def __init__(
+        self,
+        spectra_dir,
+        max_phases,
+        cutoff_intensity,
+        min_conf=25.0,
+        wavelength="CuKa",
+        reference_dir="References",
+        min_angle=10.0,
+        max_angle=80.0,
+        model_path="Model.h5",
+        is_pdf=False,
+    ):
         """
-        Subtract a phase that has already been identified from a given XRD spectrum.
-        If all phases have already been identified, halt the iteration.
-
-        Args:
-            predicted_cmpd: phase that has been identified
-            orig_y: measured spectrum including the phase the above phase
-            last_normalization: normalization factor used to scale the previously stripped
-                spectrum to 100 (required by the CNN). This is necessary to determine the
-                magnitudes of intensities relative to the initially measured pattern.
-            cutoff: the % cutoff used to halt the phase ID iteration. If all intensities are
-                below this value in terms of the originally measured maximum intensity, then
-                the code assumes that all phases have been identified.
-        Returns:
-            stripped_y: new spectrum obtained by subtrating the peaks of the identified phase
-            new_normalization: scaling factor used to ensure the maximum intensity is equal to 100
-            Or
-            If intensities fall below the cutoff, preserve orig_y and return Nonetype
-                the for new_normalization constant.
+        Parameters
+        ----------
+        directory : str
+            Path to directory containing patterns to be analyzed.
+        reference_phases : list
+            List of phases to be used for analysis.
+        max_phases : int
+            Maximum number of phases to be considered in a mixture.
         """
-
-        # Simulate spectrum for predicted compounds
-        pred_y = self.generate_pattern(predicted_cmpd)
-
-        # Convert to numpy arrays
-        pred_y = np.array(pred_y)
-        orig_y = np.array(orig_y)
-
-        # Downsample spectra (helps reduce time for DTW)
-        downsampled_res = 0.1  # new resolution: 0.1 degrees
-        num_pts = int((self.max_angle - self.min_angle) / downsampled_res)
-        orig_y = resample(orig_y, num_pts)
-        pred_y = resample(pred_y, num_pts)
-
-        # Calculate window size for DTW
-        allow_shifts = 0.75  # Allow shifts up to 0.75 degrees
-        window_size = int(allow_shifts * num_pts / (self.max_angle - self.min_angle))
-
-        # Get warped spectrum (DTW)
-        distance, path = metrics.dtw(
-            pred_y,
-            orig_y,
-            method="sakoechiba",
-            options={"window_size": window_size},
-            return_path=True,
-        )
-        index_pairs = path.transpose()
-        warped_spectrum = orig_y.copy()
-        for ind1, ind2 in index_pairs:
-            distance = abs(ind1 - ind2)
-            if distance <= window_size:
-                warped_spectrum[ind2] = pred_y[ind1]
-            else:
-                warped_spectrum[ind2] = 0.0
-
-        # Now, upsample spectra back to their original size (4501)
-        warped_spectrum = resample(warped_spectrum, 4501)
-        orig_y = resample(orig_y, 4501)
-
-        # Scale warped spectrum so y-values match measured spectrum
-        scaled_spectrum, scaling_constant = self.scale_spectrum(warped_spectrum, orig_y)
-
-        # Subtract scaled spectrum from measured spectrum
-        stripped_y = self.strip_spectrum(scaled_spectrum, orig_y)
-        stripped_y = self.smooth_spectrum(stripped_y)
-        stripped_y = np.array(stripped_y) - min(stripped_y)
-
-        # Normalization
-        new_normalization = 100 / max(stripped_y)
-        actual_intensity = max(stripped_y) / last_normalization
-
-        # Calculate actual scaling constant
-        scaling_constant /= last_normalization
-
-        # If intensities fall above cutoff, halt enumeration
-        if actual_intensity < self.cutoff:
-            is_done = True
-        else:
-            is_done = False
-
-        stripped_y = new_normalization * stripped_y
-
-        return (
-            stripped_y,
-            last_normalization * new_normalization,
-            scaling_constant,
-            is_done,
+        super().__init__(
+            max_phases=max_phases,
+            cutoff_intensity=cutoff_intensity,
+            min_conf=min_conf,
+            wavelength=wavelength,
+            min_angle=min_angle,
+            max_angle=max_angle,
+            model_path=model_path,
+            is_pdf=is_pdf,
         )
 
-    def generate_pattern(self, cmpd):
+        self.spectra_dir = spectra_dir
+        self.ref_dir = reference_dir
+
+    @property
+    def reference_phases(self):
+        return sorted(os.listdir(self.ref_dir))
+
+    def predict(self, filename: str):
         """
-        Calculate the XRD spectrum of a given compound.
+        Predicts the phases present in a given spectrum.
 
-        Args:
-            cmpd: filename of the structure file to calculate the spectrum for
-        Returns:
-            all_I: list of intensities as a function of two-theta
+        Parameters
+        ----------
+        filename : str
+            Name of file to be analyzed.
+
+        Returns
+        -------
+        prediction_list : list
+            List of all enumerated mixtures.
+        confidence_list : list
+            List of probabilities associated with the above mixtures.
         """
+        twotheta, intensity = self._load_pattern_from_file(filename)
+        return super().predict(twotheta=twotheta, intensity=intensity)
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")  # don't print occupancy-related warnings
-            struct = Structure.from_file("%s/%s" % (self.ref_dir, cmpd))
-        twotheta = np.linspace(self.min_angle, self.max_angle, 4501)
-        signal = generate_pattern(
-            structure=struct,
-            twotheta=twotheta,
-            normalize=True,
-            domain_size_nm=25.0,
-            wavelength_angstroms=self.wavelen,
-        )
-
-        return signal
-
-    def scale_spectrum(self, pred_y, obs_y):
+    def _load_pattern_from_file(self, filename):
         """
-        Scale the magnitude of a calculated spectrum associated with an identified
-        phase so that its peaks match with those of the measured spectrum being classified.
+        Loads a spectrum from a file.
 
-        Args:
-            pred_y: spectrum calculated from the identified phase after fitting
-                has been performed along the x-axis using DTW
-            obs_y: observed (experimental) spectrum containing all peaks
-        Returns:
-            scaled_spectrum: spectrum associated with the reference phase after scaling
-                has been performed to match the peaks in the measured pattern.
+        Parameters
+        ----------
+        filename : str
+            Name of file to be analyzed.
+
+        Returns
+        -------
+        twotheta : list
+            Two-theta values of the spectrum.
+        intensity : list
+            Intensity values of the spectrum.
         """
+        data = np.loadtxt(os.path.join(self.spectra_dir, filename))
+        twotheta = data[:, 0]
+        intensity = data[:, 1]
 
-        # Ensure inputs are numpy arrays
-        pred_y = np.array(pred_y)
-        obs_y = np.array(obs_y)
-
-        # Find scaling constant that minimizes MSE between pred_y and obs_y
-        all_mse = []
-        for scale_spectrum in np.linspace(1.1, 0.05, 101):
-            ydiff = obs_y - (scale_spectrum * pred_y)
-            mse = np.mean(ydiff**2)
-            all_mse.append(mse)
-        best_scale = np.linspace(1.0, 0.05, 101)[np.argmin(all_mse)]
-        scaled_spectrum = best_scale * np.array(pred_y)
-
-        return scaled_spectrum, best_scale
-
-    def strip_spectrum(self, warped_spectrum, orig_y):
-        """
-        Subtract one spectrum from another. Note that when subtraction produces
-        negative intensities, those values are re-normalized to zero. This way,
-        the CNN can handle the spectrum reliably.
-
-        Args:
-            warped_spectrum: spectrum associated with the identified phase
-            orig_y: original (measured) spectrum
-        Returns:
-            fixed_y: resulting spectrum from the subtraction of warped_spectrum
-                from orig_y
-        """
-
-        # Subtract predicted spectrum from measured spectrum
-        stripped_y = orig_y - warped_spectrum
-
-        # Normalize all negative values to 0.0
-        fixed_y = []
-        for val in stripped_y:
-            if val < 0:
-                fixed_y.append(0.0)
-            else:
-                fixed_y.append(val)
-
-        return fixed_y
+        return twotheta, intensity

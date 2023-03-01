@@ -2,7 +2,8 @@ from pymatgen.core.periodic_table import Element
 from pymatgen.analysis.diffraction import xrd
 from pymatgen.core import Structure
 import numpy as np
-from .quantanalysis import quantanalysis
+from .quantanalysis import QuantAnalysis
+from .utils import get_density, get_max_intensity, get_volume
 
 
 def main(
@@ -15,7 +16,7 @@ def main(
     wavelength="CuKa",
 ):
 
-    analyzer = quantanalysis(
+    analyzer = QuantAnalysis(
         spectra_directory,
         spectrum_fname,
         predicted_phases,

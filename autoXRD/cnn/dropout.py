@@ -1,5 +1,5 @@
 import tensorflow as tf
-
+import numpy as np
 
 # Used to apply dropout during training *and* inference
 class CustomDropout(tf.keras.layers.Layer):

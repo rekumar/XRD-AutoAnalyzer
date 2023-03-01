@@ -3,6 +3,7 @@ import multiprocessing
 from tqdm import tqdm
 import numpy as np
 import os
+from autoXRD.pattern_analysis.analyzer import DirectoryPatternAnalyzer
 
 from autoXRD.pattern_analysis.utils import get_radiation_wavelength
 
@@ -95,7 +96,7 @@ class PhaseIdentifier(object):
             spectra,
         )
 
-    def classify_mixture(self, spectrum_fname):
+    def classify_mixture(self, spectrum_fname: str):
         """
         Args:
             fname: filename string of the spectrum to be classified
@@ -108,12 +109,11 @@ class PhaseIdentifier(object):
         total_confidence, all_predictions = [], []
         tabulate_conf, predicted_cmpd_set = [], []
 
-        spec_analysis = SpectrumAnalyzer(
-            self.spectra_dir,
-            spectrum_fname,
-            self.max_phases,
-            self.cutoff,
-            self.min_conf,
+        spec_analysis = DirectoryPatternAnalyzer(
+            spectra_dir=self.spectra_dir,
+            max_phases=self.max_phases,
+            cutoff_intensity=self.cutoff,
+            min_conf=self.min_conf,
             wavelen=self.wavelen,
             min_angle=self.min_angle,
             max_angle=self.max_angle,
@@ -127,7 +127,7 @@ class PhaseIdentifier(object):
             backup_mixtures,
             scalings,
             spectra,
-        ) = spec_analysis.suspected_mixtures
+        ) = spec_analysis.predict(spectrum_fname)
 
         # If classification is non-trival, identify most probable mixture
         if any(confidences):

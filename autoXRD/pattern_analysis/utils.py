@@ -1,10 +1,10 @@
 import math
 from scipy.ndimage import gaussian_filter1d
-from typing import List, Union, Tuple
+from typing import List, Tuple, Union
 import numpy as np
 from pymatgen.core import Structure
 from pymatgen.analysis.diffraction.xrd import XRDCalculator, WAVELENGTHS
-from scipy.signal import resample
+from scipy.signal import resample, filtfilt
 
 
 def get_radiation_wavelength(radiation_source: str) -> float:
@@ -33,7 +33,6 @@ def get_radiation_wavelength(radiation_source: str) -> float:
 
 
 def convert_angle(
-    self,
     two_theta: float,
     original_wavelength_angstroms: float,
     target_wavelength_angstroms: float = 1.5406,
@@ -65,8 +64,10 @@ def convert_angle(
     return None  # Angle would be outside of 0-90 range, invalid arcsin argument #TODO - handle this better
 
 
-def simulated_domain_size_stddev(
-    self, two_theta: float, domain_size_nm: float, wavelength_angstroms: float = 1.5406
+def simulate_domain_size_broadening(
+    two_theta: List[float],
+    domain_size_nm: float,
+    wavelength_angstroms: float = 1.5406,
 ):
     """
     Used to approximate the effect of diffracting domain size on the peak widths of simulated XRD patterns. Uses the Scherrer equation to calculate the FWHM of a peak, then converts to a standard deviation for a gaussian kernel that can be used to convolve a theoretical pattern.
@@ -79,6 +80,7 @@ def simulated_domain_size_stddev(
         standard deviation for gaussian kernel
     """
     ## Calculate FWHM based on the Scherrer equation
+
     K = 0.9  ## shape factor
     wavelength_nm = wavelength_angstroms * 0.1  ## angstrom to nm
     theta = np.radians(two_theta / 2.0)  ## Bragg angle in radians
@@ -86,16 +88,27 @@ def simulated_domain_size_stddev(
 
     ## Convert FWHM to std deviation of gaussian
     sigma = np.sqrt(1 / (2 * np.log(2))) * 0.5 * np.degrees(beta)
+
+    # std_dev = simulate_domain_size_broadening(
+    #     two_theta=peak_center,
+    #     domain_size_nm=domain_size_nm,
+    #     wavelength_angstroms=wavelength_angstroms,
+    # )
+
+    # # Convolution is expressed in matrix steps, not angle
+    # peak_broadening_matrix[row_idx, :] = gaussian_filter1d(
+    #     input=peak_broadening_matrix[row_idx, :],
+    #     sigma=np.sqrt(std_dev) / twotheta_step_size,
+    #     mode="constant",
+    # )
     return sigma**2
 
 
 def get_stick_pattern(
-    self, structure: Structure, twotheta_min: float, twotheta_max: float
-) -> Tuple(np.ndarray, np.ndarray):
+    structure: Structure, twotheta_min: float, twotheta_max: float
+) -> Tuple[np.ndarray, np.ndarray]:
 
-    pattern = self.calculator.get_pattern(
-        structure, two_theta_range=(twotheta_min, twotheta_max)
-    )
+    pattern = XRDCalculator().get_pattern(structure, two_theta_range=(twotheta_min, twotheta_max))
     angles = pattern.x
     intensities = pattern.y
 
@@ -128,7 +141,7 @@ def generate_pattern(
         stick_col_idx = np.argmin(np.abs(twotheta - peak_center))
         peak_broadening_matrix[row_idx, stick_col_idx] = stick_pattern.y[row_idx]
 
-        std_dev = simulated_domain_size_stddev(
+        std_dev = simulate_domain_size_broadening(
             two_theta=peak_center,
             domain_size_nm=domain_size_nm,
             wavelength_angstroms=wavelength_angstroms,
@@ -173,3 +186,85 @@ def XRDtoPDF(
     pdf = list(resample(pdf, len(twotheta)))
 
     return pdf
+
+
+def scale_spectrum(pred_y, obs_y):
+    """
+    Scale the magnitude of a calculated spectrum associated with an identified
+    phase so that its peaks match with those of the measured spectrum being classified.
+
+    Args:
+        pred_y: spectrum calculated from the identified phase after fitting
+            has been performed along the x-axis using DTW
+        obs_y: observed (experimental) spectrum containing all peaks
+    Returns:
+        scaled_spectrum: spectrum associated with the reference phase after scaling
+            has been performed to match the peaks in the measured pattern.
+        scale_factor: scaling factor used to scale the spectrum
+    """
+
+    # Ensure inputs are numpy arrays
+    pred_y = np.array(pred_y)
+    obs_y = np.array(obs_y)
+
+    # Find scaling constant that minimizes MSE between pred_y and obs_y
+    all_mse = []
+    for scale_spectrum in np.linspace(1.1, 0.05, 101):
+        ydiff = obs_y - (scale_spectrum * pred_y)
+        mse = np.mean(ydiff**2)
+        all_mse.append(mse)
+    best_scale = np.linspace(1.0, 0.05, 101)[np.argmin(all_mse)]
+    scaled_spectrum = best_scale * np.array(pred_y)
+
+    return scaled_spectrum, best_scale
+
+
+def strip_spectrum(warped_spectrum, orig_y):
+    """
+    Subtract one spectrum from another. Note that when subtraction produces
+    negative intensities, those values are re-normalized to zero. This way,
+    the CNN can handle the spectrum reliably.
+
+    Args:
+        warped_spectrum: spectrum associated with the identified phase
+        orig_y: original (measured) spectrum
+    Returns:
+        fixed_y: resulting spectrum from the subtraction of warped_spectrum
+            from orig_y
+    """
+
+    # Subtract predicted spectrum from measured spectrum
+    stripped_y = orig_y - warped_spectrum
+
+    # Normalize all negative values to 0.0
+    fixed_y = []
+    for val in stripped_y:
+        if val < 0:
+            fixed_y.append(0.0)
+        else:
+            fixed_y.append(val)
+
+    return fixed_y
+
+
+def smooth_spectrum(spectrum, n=20):
+    """
+    Process and remove noise from the spectrum.
+
+    Args:
+        spectrum: list of intensities as a function of 2-theta
+        n: parameters used to control smooth. Larger n means greater smoothing.
+            20 is typically a good number such that noise is reduced while
+            still retaining minor diffraction peaks.
+    Returns:
+        smoothed_ys: processed spectrum after noise removal
+    """
+
+    # Smoothing parameters defined by n
+    b = [1.0 / n] * n
+    a = 1
+
+    # Filter noise
+    smoothed_ys = filtfilt(b, a, spectrum)
+
+    return smoothed_ys

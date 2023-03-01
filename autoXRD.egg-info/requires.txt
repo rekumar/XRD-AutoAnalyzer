@@ -1,0 +1,7 @@
+numpy
+pymatgen
+scipy
+scikit-image
+pyxtal
+pyts
+tqdm

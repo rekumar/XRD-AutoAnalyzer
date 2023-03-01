@@ -1,3 +1,4 @@
+import numpy as np
 from scipy.signal import filtfilt, resample
 from skimage import restoration
 import math
@@ -5,6 +6,9 @@ import warnings
 from pyts import metrics
 from scipy.ndimage import gaussian_filter1d
 from scipy import interpolate as ip
+from pymatgen.core import Structure
+from pymatgen.analysis.diffraction import xrd
+from autoXRD.pattern_analysis.utils import generate_pattern
 
 
 class QuantAnalysis(object):
@@ -207,42 +211,15 @@ class QuantAnalysis(object):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")  # don't print occupancy-related warnings
             struct = Structure.from_file("%s/%s" % (self.ref_dir, cmpd))
-        equil_vol = struct.volume
-        pattern = self.calculator.get_pattern(
-            struct, two_theta_range=(self.min_angle, self.max_angle)
+        twotheta = np.linspace(self.min_angle, self.max_angle, 4501)
+        signal = generate_pattern(
+            structure=struct,
+            twotheta=twotheta,
+            normalize=True,
+            domain_size_nm=25.0,
+            wavelength_angstroms=self.wavelen,
         )
-        angles = pattern.x
-        intensities = pattern.y
-
-        steps = np.linspace(self.min_angle, self.max_angle, 4501)
-
-        signals = np.zeros([len(angles), steps.shape[0]])
-
-        for i, ang in enumerate(angles):
-            # Map angle to closest datapoint step
-            idx = np.argmin(np.abs(ang - steps))
-            signals[i, idx] = intensities[i]
-
-        # Convolute every row with unique kernel
-        # Iterate over rows; not vectorizable, changing kernel for every row
-        domain_size = 25.0
-        step_size = (self.max_angle - self.min_angle) / 4501
-        for i in range(signals.shape[0]):
-            row = signals[i, :]
-            ang = steps[np.argmax(row)]
-            std_dev = self.calc_std_dev(ang, domain_size)
-            # Gaussian kernel expects step size 1 -> adapt std_dev
-            signals[i, :] = gaussian_filter1d(
-                row, np.sqrt(std_dev) * 1 / step_size, mode="constant"
-            )
-
-        # Combine signals
-        signal = np.sum(signals, axis=0)
-
-        # Normalize signal
-        norm_signal = 100 * signal / max(signal)
-
-        return norm_signal
+        return signal
 
     def convert_angle(self, angle):
         """
