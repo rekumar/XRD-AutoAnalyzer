@@ -3,7 +3,6 @@ from multiprocessing import Pool, Manager
 from pymatgen.core import Structure
 from scipy import signal
 import multiprocessing
-import pymatgen as mg
 import numpy as np
 import math
 import os
