@@ -11,7 +11,7 @@ class StructureFilter(object):
     under (or nearest to) ambient conditions.
     """
 
-    def __init__(self, cif_directory, enforce_order):
+    def __init__(self, cif_directory:str, enforce_order:bool):
         """
         Args:
             cif_directory: path to directory containing
@@ -37,7 +37,7 @@ class StructureFilter(object):
 
         strucs, temps, dates = [], [], []
         for cmpd in os.listdir(self.cif_dir):
-            struc = Structure.from_file("%s/%s" % (self.cif_dir, cmpd))
+            struc = Structure.from_file(os.path.join(self.cif_dir, cmpd))
             if self.enforce_order:
                 if struc.is_ordered:
                     strucs.append(struc)
@@ -64,7 +64,7 @@ class StructureFilter(object):
         """
 
         temp, date = 0.0, None
-        with open("%s/%s" % (self.cif_dir, filename)) as entry:
+        with open(os.path.join(self.cif_dir, filename)) as entry:
             for line in entry.readlines():
                 if "_audit_creation_date" in line:
                     date = line.split()[-1]

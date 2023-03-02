@@ -1,10 +1,15 @@
+import os
 import numpy as np
 import tensorflow as tf
 from random import shuffle
 from autoXRD.cnn.dropout import CustomDropout
+from warnings import warn
+import h5py
+from typing import Dict, List, Optional, Tuple
+from pymatgen.core import Structure
 
 
-class DataSetUp(object):
+class TrainingDataHandler(object):
     """
     Class used to train a convolutional neural network on a given
     set of X-ray diffraction spectra to perform phase identification.
@@ -33,9 +38,7 @@ class DataSetUp(object):
         List of indices to keep track of xrd spectra such that
             each index is associated with a reference phase.
         """
-        xrd = self.xrd
-        num_phases = self.num_phases
-        return [v for v in range(num_phases)]
+        return [v for v in range(self.num_phases)]
 
     @property
     def x(self):
@@ -114,7 +117,7 @@ def train_model(
     is_pdf,
     n_dense=[3100, 1200],
     dropout_rate=0.7,
-):
+) -> tf.keras.Model:
     """
     Args:
         x_train: numpy array of simulated xrd spectra
@@ -249,22 +252,75 @@ def test_model(model, test_x, test_y):
             the reference phases
     """
     _, acc = model.evaluate(test_x, test_y)
-    print("Test Accuracy: " + str(acc * 100) + "%")
+    print("Test Accuracy: " + str(round(acc * 100, 2)) + "%")
+    return acc
 
 
-def main(xrd, num_epochs, testing_fraction, is_pdf, fmodel="Model.h5"):
+def main(
+    xrd: np.ndarray,
+    reference_structures: Dict[str, Structure],
+    num_epochs: int,
+    testing_fraction: float,
+    is_pdf: bool,
+    savepath: Optional[str] = None,
+):
+    if len(reference_structures) != xrd.shape[0]:
+        raise ValueError(
+            "Length of reference_names must match number of rows in xrd matrix!"
+        )
+    if savepath is None:
+        if is_pdf:
+            savepath = "Model_PDF.autoxrd.h5"
+        else:
+            savepath = "Model_XRD.autoxrd.h5"
+    elif not savepath.endswith(".h5"):
+        raise ValueError("Model file must be a .h5 file. You provided: " + savepath)
 
     # Organize data
-    obj = DataSetUp(xrd, testing_fraction)
-    num_phases = obj.num_phases
-    train_x, train_y, test_x, test_y = obj.split_training_testing()
+    data_handler = TrainingDataHandler(xrd, testing_fraction)
+    num_phases = data_handler.num_phases
+    train_x, train_y, test_x, test_y = data_handler.split_training_testing()
 
     # Train model
     model = train_model(train_x, train_y, num_phases, num_epochs, is_pdf)
 
     # Save model
-    model.save(fmodel, include_optimizer=False)
+    model.save(savepath, include_optimizer=False)
+
+    # save reference structures inside the model h5 file
+    #
+    # file
+    #   - model (tensorflow)
+    #   - reference_structures (same order as model)
+    #       - name (list of strings)
+    #       - cif (list of strings to be loaded with Structure.from_str(s, fmt="cif"))
+    with h5py.File(savepath, "a") as f:
+        g = f.create_group(name="reference_structures")
+        g.create_dataset(name="name", data=list(reference_structures.keys()))
+        g.create_dataset(
+            name="cif", data=[s.to(fmt="cif") for s in reference_structures.values()]
+        )
 
     # Test model is any data is reserved for testing
     if testing_fraction != 0:
         test_model(model, test_x, test_y)
+
+
+def load_model(model_path: str) -> Tuple[tf.keras.Model, Dict[str, Structure]]:
+    """
+    Args:
+        model_path: path to model file
+    Returns:
+        model: tensorflow.keras.Model object
+        reference structures: Dict of [reference name: pymatgen Structure of reference]
+    """
+    model = tf.keras.models.load_model(model_path)
+    with h5py.File(model_path, "r") as f:
+        reference_names = list(f["reference_structures"]["name"])
+        reference_structures = [
+            Structure.from_str(s, fmt="cif") for s in f["reference_structures"]["cif"]
+        ]
+    return model, {
+        name: structure
+        for name, structure in zip(reference_names, reference_structures)
+    }
